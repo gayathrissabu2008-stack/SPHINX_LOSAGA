@@ -4,3 +4,9 @@ primaryColor = "#16284f"
 backgroundColor = "#ffffff"
 secondaryBackgroundColor = "#f4f7fb"
 textColor = "#16284f"
+
+[client]
+toolbarMode = "minimal"      # hides the Deploy button
+
+[browser]
+gatherUsageStats = false

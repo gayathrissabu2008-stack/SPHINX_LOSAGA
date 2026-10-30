@@ -1,7 +1,8 @@
-# frontend/app.py  (polished version)
+# frontend/app.py  (v3: cleaner, more like a real product)
 import random
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -11,28 +12,54 @@ API = "http://localhost:8000"     # where your FastAPI backend runs
 APP_NAME = "LOSAGA"               # change to your product name
 
 st.set_page_config(page_title=f"{APP_NAME} | Payment Protection",
-                   page_icon="🛡️", layout="wide")
-
-PAYEES = ["Rahul Kumar", "Priya Sharma", "Amit Verma", "Neha Singh",
-          "Karan Mehta", "Sneha Iyer"]
+                   page_icon=":material/shield:", layout="wide")
 
 # ======================================================================
-# 0. Styling (CSS injected into the page)
+# 0. Logo and styling
 # ======================================================================
+# The app writes this logo file once. To use your own (e.g. a Figma export),
+# just replace frontend/assets/logo.svg. Delete it to regenerate this one.
+LOGO_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 190 44" width="190" height="44">
+  <path d="M22 3 L39 9 V22 C39 31 32 38 22 41 C12 38 5 31 5 22 V9 Z" fill="#16284f"/>
+  <path d="M16 14 V28 H28" fill="none" stroke="#ffffff" stroke-width="3.6"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="28" cy="14" r="2.6" fill="#4cc2a8"/>
+  <text x="50" y="29" font-family="Inter, 'Segoe UI', Arial, sans-serif" font-size="21"
+        font-weight="800" letter-spacing="3.2" fill="#16284f">__APP__</text>
+</svg>"""
+LOGO = Path(__file__).parent / "assets" / "logo.svg"
+if not LOGO.exists():
+    LOGO.parent.mkdir(exist_ok=True)
+    LOGO.write_text(LOGO_SVG.replace("__APP__", APP_NAME), encoding="utf-8")
+st.logo(str(LOGO), size="large")
+
 CSS = """
 <style>
-#MainMenu, footer {visibility: hidden;}
-.block-container {padding-top: 2rem; max-width: 1200px;}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+/* Inter for text and headings (not applied everywhere, so icons keep working) */
+h1, h2, h3, h4, [data-testid="stMarkdownContainer"] {font-family: 'Inter', 'Segoe UI', sans-serif;}
+
+/* Fixes the clipped top: leave room for Streamlit's fixed header */
+.block-container {padding-top: 4.5rem; max-width: 1100px;}
+[data-testid="stToolbar"] {visibility: hidden;}
+
+h1 {font-size: 1.9rem !important; font-weight: 700 !important;
+    letter-spacing: -0.01em; padding: 0.1rem 0 1rem 0 !important;}
+h3 {font-size: 1.15rem !important; font-weight: 600 !important;}
+
 .eyebrow {font-size: .72rem; font-weight: 700; letter-spacing: .14em;
-          text-transform: uppercase; color: #2f5da8; margin: 0;}
+          text-transform: uppercase; color: #2f5da8; margin: 0 0 .2rem 0;}
+.status {font-size: .82rem; color: #5b6b85; margin-top: .5rem;}
+
 [data-testid="stMetric"] {background: #fff; border: 1px solid #e3e8ef;
           border-radius: 12px; padding: 16px 18px;}
+[data-testid="stMetricLabel"] {color: #5b6b85;}
+[data-testid="stVerticalBlockBorderWrapper"] {border-radius: 12px;}
 [data-testid="stSidebar"] {border-right: 1px solid #e3e8ef;}
-[data-testid="stSidebarNav"]::before {content: "🛡️ __APP__"; display: block;
-          font-weight: 800; font-size: 1.3rem; letter-spacing: .08em;
-          padding: 1rem 1rem .5rem;}
+.stButton > button {border-radius: 8px; font-weight: 600;}
 </style>
-""".replace("__APP__", APP_NAME)
+"""
 st.markdown(CSS, unsafe_allow_html=True)
 
 
@@ -63,15 +90,34 @@ def api_post(path, payload=None):
 
 
 # ======================================================================
-# 2. Things remembered between reruns
+# 2. Who you can pay, and the things remembered between reruns
 # ======================================================================
-st.session_state.setdefault("history", [])    # the customer's own payments
-st.session_state.setdefault("feed", [])       # the bank's live feed
-st.session_state.setdefault("outcome", None)  # message shown after a payment
+NEW_PAYEE = "Someone new (enter UPI ID)"
+# name -> (payment type for the model, is this payee already known to the customer?)
+PAYEES = {
+    "Rahul Kumar (saved contact)": ("TRANSFER", True),
+    "Priya Sharma (saved contact)": ("TRANSFER", True),
+    "Metro Grocery (merchant)": ("PAYMENT", True),
+    NEW_PAYEE: ("TRANSFER", False),
+}
+
+DEFAULTS = {
+    "history": [],                 # the customer's own payments
+    "feed": [],                    # the bank's live feed
+    "outcome": None,               # message shown after a payment
+    "pay_to": "Rahul Kumar (saved contact)",
+    "pay_upi": "",
+    "pay_amount": 500.0,
+    "pay_request": False,
+    "acct_balance": 50000.0,       # the customer's account (set in Demo controls)
+    "acct_usual": 1000.0,          # their typical payment size
+}
+for key, value in DEFAULTS.items():
+    st.session_state.setdefault(key, value)
 
 
 def colour_rows(row):
-    """Red background for RISKY rows, green for SAFE."""
+    """Light red background for RISKY rows, light green for SAFE."""
     bg = "#ffd9d9" if row["Verdict"] == "RISKY" else "#dcf5e3"
     return [f"background-color: {bg}; color: #111"] * len(row)
 
@@ -83,34 +129,33 @@ def history_table(rows, limit=None):
 
 
 def set_status(entry_id, status):
-    """Update a payment's status in history (used by the popup buttons)."""
     for h in st.session_state["history"]:
         if h["id"] == entry_id:
             h["Status"] = status
 
 
 # ======================================================================
-# 3. Payment check + warning popup
+# 3. Payment check and warning popup
 # ======================================================================
-@st.dialog("⚠️ Suspicious payment detected")
+@st.dialog("Suspicious payment detected")
 def warning_dialog(entry_id, payee, amount, result):
-    st.error(f"This payment of ₹{amount:,.2f} to **{payee}** has a "
-             f"**{result['risk_score'] * 100:.0f}% risk** of being fraud.")
+    st.error(f"This payment of ₹{amount:,.2f} to {payee} has a "
+             f"{result['risk_score'] * 100:.0f}% risk of being fraud.")
     st.caption(f"Flagged by: {result['flagged_by']}")
-    st.markdown("**Why it looks suspicious:**")
+    st.markdown("**Why it looks suspicious**")
     for reason in result["reasons"]:
         st.markdown(f"- {reason}")
 
     left, right = st.columns(2)
-    if left.button("🛑 Cancel payment", type="primary"):
+    if left.button("Cancel payment", type="primary"):
         set_status(entry_id, "Cancelled by you")
         st.session_state["outcome"] = ("success",
-            "🛡️ Payment cancelled. You may have just avoided a scam.")
+            "Payment cancelled. You may have just avoided a scam.")
         st.rerun()                # closes the popup and refreshes the page
     if right.button("Pay anyway"):
         set_status(entry_id, "Sent despite warning")
         st.session_state["outcome"] = ("warning",
-            f"⚠️ ₹{amount:,.2f} sent to {payee} despite the warning.")
+            f"₹{amount:,.2f} was sent to {payee} despite the warning.")
         st.rerun()
 
 
@@ -119,7 +164,7 @@ def check_and_pay(payee, payload):
     st.session_state["outcome"] = None
     result = api_post("/score", payload)
     if result is None:
-        st.error("Could not reach the fraud API. Is the backend running?")
+        st.error("Could not reach the fraud engine. Is the backend running?")
         return
 
     risky = result["verdict"] == "RISKY"
@@ -140,34 +185,30 @@ def check_and_pay(payee, payload):
         warning_dialog(entry_id, payee, payload["amount"], result)
     else:
         st.session_state["outcome"] = ("success",
-            f"✅ ₹{payload['amount']:,.2f} sent to {payee}. "
+            f"₹{payload['amount']:,.2f} sent to {payee}. "
             f"Risk {result['risk_score'] * 100:.0f}%, looks safe.")
 
 
-def load_sample(fraud):
-    """Button callback: fetch a real unseen payment from GET /sample."""
+def run_dataset_payment(fraud):
+    """Demo control: score a real unseen payment from the dataset (ML model only)."""
     data = api_get("/sample", params={"fraud": "true" if fraud else "false"})
     if data is None:
-        st.session_state["sample"] = None
+        st.error("Could not reach the fraud engine.")
         return
-    label = data.pop("actual_label")       # remove the answer key
-    st.session_state["sample"] = {"payee": random.choice(PAYEES),
-                                  "payload": data, "actual_label": label}
-    st.session_state["outcome"] = None
-
-
-def scenario_scam():
-    """Button callback: fill tab 2 with a fake collect-request scam."""
-    st.session_state.update({"m_payee": "Rewards Support", "m_amount": 25000.0,
-        "m_type": "TRANSFER", "m_balance": 26000.0, "m_usual": 1000.0,
-        "m_known": False, "m_collect": True})
+    data.pop("actual_label")               # remove the answer key
+    check_and_pay(random.choice(["Rahul Kumar", "Priya Sharma", "Amit Verma"]), data)
 
 
 def scenario_normal():
-    """Button callback: fill tab 2 with an everyday payment."""
-    st.session_state.update({"m_payee": "Rahul Kumar", "m_amount": 500.0,
-        "m_type": "TRANSFER", "m_balance": 50000.0, "m_usual": 1000.0,
-        "m_known": True, "m_collect": False})
+    """Callback: fill the form with an everyday payment."""
+    st.session_state.update({"pay_to": "Rahul Kumar (saved contact)",
+                             "pay_upi": "", "pay_amount": 500.0, "pay_request": False})
+
+
+def scenario_scam():
+    """Callback: fill the form with a fake collect-request scam."""
+    st.session_state.update({"pay_to": NEW_PAYEE, "pay_upi": "rewards.helpdesk@upi",
+                             "pay_amount": 25000.0, "pay_request": True})
 
 
 # ======================================================================
@@ -191,98 +232,95 @@ def show_home():
 
     left, right = st.columns([2, 1])
     with left:
-        with st.container(border=True):                # a "card"
+        with st.container(border=True):
             eyebrow("Payment activity")
             st.subheader("Recent transactions")
             if history:
                 history_table(history, limit=8)
             else:
                 st.info("No transactions yet. Your payment activity will "
-                        "appear here once you start checking payments.")
+                        "appear here once you start making payments.")
     with right:
         with st.container(border=True):
             eyebrow("Before you pay")
             st.subheader("Check a payment")
             st.write(f"Not sure whether a payment request is genuine? "
-                     f"{APP_NAME} will help assess its risk.")
-            if st.button("Start safety check", type="primary"):
+                     f"{APP_NAME} checks the risk before the money leaves your account.")
+            if st.button("Make a payment", type="primary"):
                 st.switch_page(safety_page)
 
 
 def show_safety_check():
     eyebrow("Before you pay")
-    st.title("Safety check")
-    tab_demo, tab_manual = st.tabs(["🎲 Demo payment (real sample)",
-                                    "✍️ My own payment"])
+    st.title("Make a payment")
 
-    # ---- Tab 1: a real payment from the model's unseen test data ----
-    with tab_demo:
-        st.write("Load a real payment the model has never seen, then press Pay.")
-        b1, b2 = st.columns(2)
-        b1.button("🎲 Load sample payment", on_click=load_sample, args=(False,))
-        b2.button("🚨 Load sample scam", on_click=load_sample, args=(True,))
+    balance = st.session_state["acct_balance"]
+    usual = st.session_state["acct_usual"]
 
-        sample = st.session_state.get("sample")
-        if sample:
-            p = sample["payload"]
-            with st.container(border=True):
-                st.markdown(f"**To:** {sample['payee']}  \n"
-                            f"**Amount:** ₹{p['amount']:,.2f}  \n"
-                            f"**Type:** {p['type']}")
-                with st.expander("Account details (filled in by the bank system)"):
-                    st.json(p)
-                    st.caption(f"Answer key (demo only): really {sample['actual_label']}")
-                if st.button("💸 Pay now", key="pay_demo", type="primary"):
-                    check_and_pay(sample["payee"], p)
+    form_col, info_col = st.columns([3, 2], gap="large")
 
-    # ---- Tab 2: your own payment, ML model + safety rules ----
-    with tab_manual:
-        # defaults, set once (widgets below read them through their keys)
-        for key, default in {"m_payee": "Rahul Kumar", "m_amount": 500.0,
-                             "m_type": "TRANSFER", "m_balance": 50000.0,
-                             "m_usual": 1000.0, "m_known": True,
-                             "m_collect": False}.items():
-            st.session_state.setdefault(key, default)
+    with form_col:
+        with st.container(border=True):
+            choice = st.selectbox("Pay to", list(PAYEES), key="pay_to")
+            tx_type, payee_known = PAYEES[choice]
 
-        st.write("Type a payment, or try a ready-made scenario:")
-        s1, s2 = st.columns(2)
-        s1.button("✅ Everyday payment", on_click=scenario_normal)
-        s2.button("🚨 Fake collect-request scam", on_click=scenario_scam)
-
-        payee = st.text_input("Pay to", key="m_payee")
-        c1, c2 = st.columns(2)
-        amount = c1.number_input("Amount (₹)", min_value=1.0, step=100.0, key="m_amount")
-        tx_type = c2.selectbox("Payment type", ["TRANSFER", "PAYMENT"], key="m_type")
-        balance = c1.number_input("Your account balance (₹)", min_value=0.0,
-                                  step=1000.0, key="m_balance")
-        usual = c2.number_input("Your usual payment size (₹)", min_value=1.0,
-                                step=100.0, key="m_usual")
-        known = st.checkbox("I've paid this person before (saved contact)", key="m_known")
-        collect = st.checkbox("This is a 'request money' (collect) approval", key="m_collect")
-
-        if st.button("💸 Pay now", key="pay_manual", type="primary"):
-            if amount > balance:
-                st.error("Insufficient balance.")
+            if choice == NEW_PAYEE:
+                payee_name = st.text_input("UPI ID", placeholder="name@bank",
+                                           key="pay_upi").strip()
             else:
-                check_and_pay(payee, {
-                    "amount": amount,
-                    "type": tx_type,
-                    "oldbalanceOrg": balance,
-                    "newbalanceOrig": balance - amount,
-                    "oldbalanceDest": 0.0,
-                    "newbalanceDest": 0.0 if tx_type == "PAYMENT" else amount,
-                    "hour": datetime.now().hour,
-                    # context the safety rules use (a real app knows these itself)
-                    "payee_known": known,
-                    "is_collect_request": collect,
-                    "usual_amount": usual,
-                })
+                payee_name = choice.split(" (")[0]      # "Rahul Kumar"
 
-    outcome = st.session_state.get("outcome")
-    if outcome:
-        kind, text = outcome
-        st.divider()
-        (st.success if kind == "success" else st.warning)(text)
+            amount = st.number_input("Amount (₹)", min_value=1.0, step=100.0,
+                                     key="pay_amount")
+            is_request = st.checkbox(
+                "I'm paying because someone sent me a payment request",
+                key="pay_request")
+
+            if st.button("Pay now", type="primary"):
+                if choice == NEW_PAYEE and not payee_name:
+                    st.error("Enter the UPI ID to continue.")
+                elif amount > balance:
+                    st.error("Insufficient balance.")
+                else:
+                    check_and_pay(payee_name, {
+                        "amount": amount,
+                        "type": tx_type,
+                        "oldbalanceOrg": balance,
+                        "newbalanceOrig": balance - amount,
+                        "oldbalanceDest": 0.0,
+                        # merchants keep no balance in the dataset; people do
+                        "newbalanceDest": 0.0 if tx_type == "PAYMENT" else amount,
+                        "hour": datetime.now().hour,    # the system fills in the time
+                        # context the safety rules use (a real app knows these itself)
+                        "payee_known": payee_known,
+                        "is_collect_request": is_request,
+                        "usual_amount": usual,
+                    })
+
+        outcome = st.session_state.get("outcome")
+        if outcome:
+            kind, text = outcome
+            (st.success if kind == "success" else st.warning)(text)
+
+    with info_col:
+        with st.container(border=True):
+            eyebrow("From account")
+            st.metric("Available balance", f"₹{balance:,.2f}")
+            st.caption("Savings account ending 4821. Every payment is checked "
+                       "for fraud before it is sent.")
+
+    with st.expander("Demo controls (for judges)"):
+        st.caption("Shortcuts for the live demo. A real customer would not see this.")
+        d1, d2, d3 = st.columns(3)
+        d1.button("Fill: everyday payment", on_click=scenario_normal)
+        d2.button("Fill: fake collect-request scam", on_click=scenario_scam)
+        if d3.button("Run a real dataset scam"):
+            run_dataset_payment(fraud=True)
+        a1, a2 = st.columns(2)
+        a1.number_input("Account balance (₹)", min_value=0.0, step=1000.0,
+                        key="acct_balance")
+        a2.number_input("Usual payment size (₹)", min_value=1.0, step=100.0,
+                        key="acct_usual")
 
 
 def show_transactions():
@@ -295,17 +333,17 @@ def show_transactions():
             st.session_state["history"] = []
             st.rerun()
     else:
-        st.info("No transactions yet. Run a safety check first.")
+        st.info("No transactions yet. Make a payment to see it here.")
 
 
 def show_insights():
     eyebrow("Your payment safety")
     st.title("Understanding your activity")
-    st.write(f"{APP_NAME} uses transaction patterns and risk indicators to help "
-             f"you spot potentially suspicious payments.")
+    st.write(f"{APP_NAME} looks at transaction patterns and risk indicators to "
+             f"help you spot potentially suspicious payments.")
     history = st.session_state["history"]
     if not history:
-        st.info("Insights appear after you check a few payments.")
+        st.info("Insights appear after you make a few payments.")
         return
     safe = sum(1 for h in history if h["Verdict"] == "SAFE")
     left, right = st.columns(2)
@@ -323,7 +361,7 @@ def show_insights():
 @st.fragment(run_every=1)          # re-runs ONLY this function every second
 def live_feed():
     if st.session_state.get("live", True):
-        item = api_get("/next")    # GET /next: next unseen payment, already scored
+        item = api_get("/next")    # next unseen payment, already scored
         if item is not None:
             p, r = item["payment"], item["result"]
             st.session_state["feed"].insert(0, {
@@ -352,7 +390,7 @@ def live_feed():
     flagged = [row for row in feed if row["Verdict"] == "RISKY"]
     if flagged:
         a = flagged[0]
-        st.error(f"🚨 **Latest alert** ({a['Time']}): ₹{a['Amount (₹)']:,.0f} "
+        st.error(f"**Latest alert** ({a['Time']}): ₹{a['Amount (₹)']:,.0f} "
                  f"{a['Type']}, risk {a['Risk %']}%\n\n{a['Why flagged']}")
 
     with st.container(border=True):
@@ -367,7 +405,7 @@ def live_feed():
 def show_bank_view():
     eyebrow("Fraud operations")
     st.title("Bank fraud dashboard")
-    st.caption("Every payment is scored in real time. Red = flagged as risky.")
+    st.caption("Every payment is scored in real time. Red rows were flagged as risky.")
     c1, c2 = st.columns(2)
     c1.toggle("Live feed", value=True, key="live")
     if c2.button("Reset counters"):
@@ -380,18 +418,27 @@ def show_bank_view():
 # ======================================================================
 # 5. Navigation (the sidebar menu)
 # ======================================================================
-home_page = st.Page(show_home, title="Home", icon="🏠", default=True)
-safety_page = st.Page(show_safety_check, title="Safety Check", icon="🛡️")
-tx_page = st.Page(show_transactions, title="My Transactions", icon="📜")
-insights_page = st.Page(show_insights, title="My Insights", icon="📊")
-bank_page = st.Page(show_bank_view, title="Bank View", icon="🏦")
+home_page = st.Page(show_home, title="Home", icon=":material/home:",
+                    default=True)
+safety_page = st.Page(show_safety_check, title="Safety Check",
+                      icon=":material/shield:", url_path="safety-check")
+tx_page = st.Page(show_transactions, title="My Transactions",
+                  icon=":material/receipt_long:", url_path="transactions")
+insights_page = st.Page(show_insights, title="My Insights",
+                        icon=":material/bar_chart:", url_path="insights")
+bank_page = st.Page(show_bank_view, title="Bank View",
+                    icon=":material/account_balance:", url_path="bank-view")
 
 pg = st.navigation({"MENU": [home_page, safety_page, tx_page, insights_page],
                     "FOR BANKS": [bank_page]})
 
-if api_get("/health") is None:
-    st.sidebar.error("Backend not reachable.\n\nStart it with:\n`uvicorn main:app --reload`")
-else:
-    st.sidebar.success("Backend connected")
+online = api_get("/health") is not None
+dot = "#1a9d5c" if online else "#d93636"
+st.sidebar.markdown(
+    f'<p class="status"><span style="color:{dot}">●</span> '
+    f'Fraud engine {"online" if online else "offline"}</p>',
+    unsafe_allow_html=True)
+if not online:
+    st.sidebar.caption("Start it with: uvicorn main:app --reload")
 
 pg.run()

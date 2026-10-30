@@ -1,0 +1,7 @@
+data/
+.venv/
+fraud-env/
+__pycache__/
+.ipynb_checkpoints/
+node_modules/
+dist/

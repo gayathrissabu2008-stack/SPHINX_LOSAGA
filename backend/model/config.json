@@ -1,0 +1,15 @@
+{
+  "threshold": 0.5,
+  "reasons": {
+    "errorOrig": "Sender's balance doesn't add up after this payment",
+    "errorDest": "Receiver's balance change doesn't match the amount sent",
+    "amount": "Payment amount is unusually large",
+    "newbalanceOrig": "Sender's account is left with a zero or near-zero balance",
+    "oldbalanceOrg": "Sender's starting balance looks unusual for this payment",
+    "oldbalanceDest": "Receiver account's balance looks unusual",
+    "newbalanceDest": "Receiver's balance after payment looks unusual",
+    "type_TRANSFER": "Transfers to other accounts carry higher risk",
+    "type_CASH_OUT": "Cash-out payments carry higher risk",
+    "hour": "Payment made at an unusual time of day"
+  }
+}

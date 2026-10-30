@@ -1,0 +1,12 @@
+{
+  "threshold": 0.5,
+  "reasons": {
+    "newbalanceOrig": "Sender's balance after this payment is unusual (e.g. account emptied)",
+    "errorOrig": "Sender's balance doesn't add up after this payment",
+    "errorDest": "Receiver's balance change doesn't match the amount sent",
+    "amount": "Payment amount is unusual",
+    "oldbalanceDest": "Receiver account's balance looks unusual",
+    "type_PAYMENT": "Payment type is unusual for this pattern",
+    "type_CASH_IN": "Payment type is unusual for this pattern"
+  }
+}

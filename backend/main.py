@@ -1,6 +1,6 @@
-# backend/main.py  (FINAL)
+# backend/main.py  (FINAL: ML model + safety rules)
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional          # NEW: Optional
 import json
 import random
 
@@ -32,7 +32,6 @@ stream_df = pd.read_csv(BASE / "test_stream.csv")   # unseen rows for the demo
 # ---------- 2. Create the app and allow the frontend to call it ----------
 app = FastAPI(title="UPI Fraud Shield API")
 
-# CORS: lets a React page on another port (e.g. :5173) call this API on :8000
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],     # anyone; fine for a hackathon
@@ -49,6 +48,12 @@ class Payment(BaseModel):
     oldbalanceDest: float     # receiver's balance before
     newbalanceDest: float     # receiver's balance after
     hour: int                 # 0-23
+    # --- NEW: optional context that a payments app knows about its customer ---
+    # None = "not provided", and then the safety rules are skipped
+    # (so the PaySim sample flow still uses the ML model only).
+    payee_known: Optional[bool] = None         # paid this person before / saved contact?
+    is_collect_request: Optional[bool] = None  # approving a "request money" message?
+    usual_amount: Optional[float] = None       # the customer's typical payment size
 
 # ---------- 4. Turn a payment into the exact row the model was trained on ----------
 def build_features(p: Payment) -> pd.DataFrame:
@@ -69,6 +74,34 @@ def build_features(p: Payment) -> pd.DataFrame:
     # columns=FEATURE_COLUMNS forces the correct order
     return pd.DataFrame([row], columns=FEATURE_COLUMNS)
 
+# ---------- NEW: hand-written safety rules ----------
+def apply_rules(p: Payment):
+    """Returns (rule_score 0-1, list of plain-English reasons)."""
+    if p.payee_known is None:          # no customer context given -> skip the rules
+        return 0.0, []
+
+    score, reasons = 0.0, []
+
+    # Classic UPI scam: a stranger sends a "collect" request and you approve it
+    if p.is_collect_request and not p.payee_known:
+        score += 0.60
+        reasons.append("An unknown person is requesting money from you. "
+                       "You never need to approve a request to receive money")
+    if not p.payee_known and p.amount >= 10_000:
+        score += 0.30
+        reasons.append("Large payment to someone you have never paid before")
+    if p.oldbalanceOrg > 0 and p.amount >= 0.9 * p.oldbalanceOrg:
+        score += 0.30
+        reasons.append("This payment would use up almost your entire balance")
+    if p.usual_amount and p.amount >= 5 * p.usual_amount:
+        score += 0.30
+        reasons.append(f"Amount is {p.amount / p.usual_amount:.0f}x your usual payment")
+    if 0 <= p.hour <= 5 and p.amount >= 10_000:
+        score += 0.20
+        reasons.append("Large payment made late at night")
+
+    return min(score, 0.99), reasons
+
 # ---------- 5. Endpoints ----------
 @app.get("/health")
 def health():
@@ -77,17 +110,33 @@ def health():
 @app.post("/score")
 def score(payment: Payment):
     X = build_features(payment)
-    risk = float(model.predict_proba(X)[0, 1])        # fraud probability, 0 to 1
+    model_score = float(model.predict_proba(X)[0, 1])    # NEW: brain 1, the ML model
+    rule_score, rule_reasons = apply_rules(payment)       # NEW: brain 2, the rules
+    risk = max(model_score, rule_score)                   # trust whichever is more worried
     verdict = "RISKY" if risk >= THRESHOLD else "SAFE"
 
     reasons = []
     if verdict == "RISKY":
-        # SHAP: how much each feature pushed this score; keep the top 3 toward fraud
-        contribs = pd.Series(explainer.shap_values(X)[0], index=FEATURE_COLUMNS)
-        top = contribs[contribs > 0].sort_values(ascending=False).head(3)
-        reasons = [REASONS.get(name, name) for name in top.index]
+        reasons += rule_reasons
+        if model_score >= THRESHOLD:     # SHAP reasons only when the ML model raised the alarm
+            contribs = pd.Series(explainer.shap_values(X)[0], index=FEATURE_COLUMNS)
+            top = contribs[contribs > 0].sort_values(ascending=False).head(3)
+            reasons += [REASONS.get(name, name) for name in top.index]
 
-    return {"risk_score": round(risk, 4), "verdict": verdict, "reasons": reasons}
+    model_flag = model_score >= THRESHOLD
+    rule_flag = rule_score >= THRESHOLD
+    flagged_by = ("model + rules" if model_flag and rule_flag else
+                  "ML model" if model_flag else
+                  "safety rules" if rule_flag else "none")
+
+    return {
+        "risk_score": round(risk, 4),
+        "verdict": verdict,
+        "reasons": reasons,
+        "flagged_by": flagged_by,           # NEW: which brain raised the alarm
+        "model_score": round(model_score, 4),
+        "rule_score": round(rule_score, 4),
+    }
 
 @app.get("/sample")
 def sample(fraud: bool = False):
@@ -119,7 +168,7 @@ def next_transaction():
 
     tx = sample(fraud=fraud)             # reuse the /sample function above
     label = tx.pop("actual_label")       # remove the answer key before scoring
-    result = score(Payment(**tx))        # reuse the /score function above
+    result = score(Payment(**tx))        # reuse /score (no context fields -> rules skipped)
 
     stats["scanned"] += 1
     if result["verdict"] == "RISKY":

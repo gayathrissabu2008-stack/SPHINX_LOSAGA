@@ -1,4 +1,4 @@
-# frontend/app.py  (v4: login system + indigo theme)
+# frontend/app.py  (v5: login system + indigo theme + rotating safety tips + scam helpline)
 import base64
 import os
 import random
@@ -17,6 +17,7 @@ import auth                      # our login module (frontend/auth.py)
 API = os.environ.get("API_URL", "http://localhost:8000")    # where the FastAPI backend runs
 DEMO_MODE = os.environ.get("DEMO_MODE", "1") == "1"         # "0" hides everything meant for judges
 FEED_SECONDS = int(os.environ.get("FEED_SECONDS", "1"))     # how often the bank feed refreshes
+TIP_SECONDS = int(os.environ.get("TIP_SECONDS", "3"))       # how often the safety tip changes
 APP_NAME = "LOSAGA"
 
 st.set_page_config(page_title=f"{APP_NAME} | Payment Protection",
@@ -107,6 +108,18 @@ h3 {font-size: 1.15rem !important; font-weight: 600 !important;}
 .login-brand {text-align: center; margin-bottom: 1.5rem;}
 .login-title {font-size: 2.3rem; font-weight: 800; letter-spacing: .1em; color: #190066;}
 .login-tag {color: #4a4a78; margin-top: .8rem;}
+
+/* Safety tip card (warm yellow) and scam helpline card (light grey-blue) */
+.tip-card, .help-card {border-radius: 16px; padding: 1.4rem 1.7rem; margin: 1rem 0 0 0;}
+.tip-card {background: #fbefd6; min-height: 8.5rem;}
+.help-card {background: #f4f7fb; border: 1px solid #dfe5f2;}
+.card-label {font-size: .78rem; font-weight: 700; letter-spacing: .16em;
+             text-transform: uppercase; color: #16284f; margin: 0 0 .7rem 0;}
+.card-text {font-size: 1.08rem; line-height: 1.6; color: #1a1a40; margin: 0;}
+.card-text a {color: #190066; font-weight: 600; text-decoration: underline;}
+.tip-text {animation: tipFade .5s ease-in;}
+@keyframes tipFade {from {opacity: 0;} to {opacity: 1;}}
+@media (prefers-reduced-motion: reduce) {.tip-text {animation: none;}}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -150,6 +163,18 @@ PAYEES = {
     NEW_PAYEE: ("TRANSFER", False),
 }
 
+# Tips shown one at a time in the Safety Tip card (change every TIP_SECONDS)
+SAFETY_TIPS = [
+    "You never need your UPI PIN to receive money. Only to send it.",
+    "Never share your UPI PIN or OTP with anyone, not even someone claiming to be from your bank.",
+    "Scanning a QR code is for paying money, never for receiving it.",
+    "Your bank will never ask you to install screen-sharing apps like AnyDesk or TeamViewer.",
+    "Always check the payee's name on screen before you enter your UPI PIN.",
+    "A prize, refund or cashback that asks you to pay first is a scam.",
+    "Don't approve a payment request you weren't expecting. Decline it.",
+    "Install payment apps only from the official Play Store or App Store.",
+]
+
 DEFAULTS = {
     "user": None,                  # who is logged in (None = nobody)
     "history": [],                 # this customer's payments
@@ -161,6 +186,7 @@ DEFAULTS = {
     "pay_request": False,
     "acct_balance": 50000.0,       # the customer's account
     "acct_usual": 1000.0,          # their typical payment size
+    "tip_index": 0,                # which safety tip is showing
 }
 for key, value in DEFAULTS.items():
     st.session_state.setdefault(key, value)
@@ -202,6 +228,33 @@ def set_status(entry_id, status):
         if h["id"] == entry_id:
             h["Status"] = status
     auth.update_status(entry_id, status)               # also save it in the database
+
+
+# ======================================================================
+# 2b. Safety tip and scam helpline cards
+# ======================================================================
+@st.fragment(run_every=TIP_SECONDS)     # re-runs ONLY this card every few seconds
+def safety_tip_card():
+    """Shows one tip, then moves to the next one on the following refresh."""
+    i = st.session_state["tip_index"] % len(SAFETY_TIPS)
+    st.markdown(
+        f'<div class="tip-card">'
+        f'<p class="card-label">Safety tip</p>'
+        f'<p class="card-text tip-text">{SAFETY_TIPS[i]}</p>'
+        f'</div>',
+        unsafe_allow_html=True)
+    st.session_state["tip_index"] = i + 1
+
+
+def scam_help_card():
+    """Static card with the national cyber crime helpline."""
+    st.markdown(
+        '<div class="help-card">'
+        '<p class="card-label">Lost money to a scam?</p>'
+        '<p class="card-text">Call <b>1930</b> (National Cyber Crime Helpline) or report at '
+        '<a href="https://cybercrime.gov.in" target="_blank" rel="noopener">cybercrime.gov.in</a>.'
+        '</p></div>',
+        unsafe_allow_html=True)
 
 
 # ======================================================================
@@ -382,6 +435,10 @@ def show_home():
                      f"{APP_NAME} checks the risk before the money leaves your account.")
             if st.button("Make a payment", type="primary"):
                 st.switch_page(safety_page)
+
+    # NEW: rotating safety tip + scam helpline, full width below the cards
+    safety_tip_card()
+    scam_help_card()
 
 
 def show_safety_check():

@@ -1,9 +1,11 @@
-# frontend/app.py  (v8: login + indigo theme + safety tips + helpline + Scan QR + live balance + IST)
+# frontend/app.py  (v10: login + theme + safety tips + helpline + Scan QR + balance + IST
+#                   + payment password + light blue cards)
 import base64
 import io
 import os
 import random
 import re
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, unquote
@@ -33,6 +35,8 @@ DEMO_MODE = os.environ.get("DEMO_MODE", "1") == "1"         # "0" hides everythi
 FEED_SECONDS = int(os.environ.get("FEED_SECONDS", "1"))     # how often the bank feed refreshes
 TIP_SECONDS = int(os.environ.get("TIP_SECONDS", "3"))       # how often the safety tip changes
 START_BALANCE = 50000.0                                     # balance every new session starts with
+MAX_PASSWORD_ATTEMPTS = 3                                   # wrong passwords allowed per payment
+LOCK_SECONDS = 60                                           # lock time after too many wrong passwords
 APP_NAME = "LOSAGA"
 
 # Indian Standard Time (UTC+5:30). The cloud server's clock is UTC, so we never use it directly.
@@ -101,10 +105,19 @@ h3 {font-size: 1.15rem !important; font-weight: 600 !important;}
 .eyebrow {font-size: .72rem; font-weight: 700; letter-spacing: .14em;
           text-transform: uppercase; color: #1c0099; margin: 0 0 .2rem 0;}
 
-/* Metric cards */
-[data-testid="stMetric"] {background: #fff; border: 1px solid #cdd6f5;
+/* Metric cards: same light blue as the helpline card */
+[data-testid="stMetric"] {background: #f4f7fb; border: 1px solid #dfe5f2;
           border-radius: 12px; padding: 16px 18px;}
 [data-testid="stMetricLabel"] {color: #4a4a78;}
+
+/* Every bordered box with a key starting "card_" gets the light blue look */
+[class*="st-key-card_"] {background: #f4f7fb !important; border-color: #dfe5f2 !important;
+          border-radius: 16px !important;}
+/* Keep input boxes white inside light blue cards so they stay visible */
+[class*="st-key-card_"] [data-baseweb="input"],
+[class*="st-key-card_"] [data-baseweb="base-input"],
+[class*="st-key-card_"] [data-baseweb="select"] > div,
+[class*="st-key-card_"] [data-testid="stFileUploaderDropzone"] {background: #ffffff !important;}
 
 /* Pill buttons, like the mockup */
 .stButton > button, [data-testid="stFormSubmitButton"] > button {
@@ -133,7 +146,7 @@ h3 {font-size: 1.15rem !important; font-weight: 600 !important;}
 .login-title {font-size: 2.3rem; font-weight: 800; letter-spacing: .1em; color: #190066;}
 .login-tag {color: #4a4a78; margin-top: .8rem;}
 
-/* Safety tip card (compact, top right) and scam helpline card (under Check a payment) */
+/* Safety tip card (yellow, compact, top right) and scam helpline card (light blue) */
 .tip-card {background: #fbefd6; border-radius: 14px; padding: .9rem 1.2rem;
            min-height: 6rem; margin: 0 0 1.2rem 0;}
 .help-card {background: #f4f7fb; border: 1px solid #dfe5f2; border-radius: 16px;
@@ -148,8 +161,9 @@ h3 {font-size: 1.15rem !important; font-weight: 600 !important;}
 @keyframes tipFade {from {opacity: 0;} to {opacity: 1;}}
 @media (prefers-reduced-motion: reduce) {.tip-text {animation: none;}}
 
-/* Scan QR button, pushed to the right edge of the home page header */
+/* Scan QR button: right edge of the home page header, light blue like the cards */
 .st-key-home_scan {align-items: flex-end;}
+.st-key-home_scan .stButton > button {background: #f4f7fb; border: 1px solid #dfe5f2;}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -219,6 +233,10 @@ DEFAULTS = {
     "tip_index": 0,                # which safety tip is showing
     "scan_prefill": None,          # QR result waiting to fill the payment form
     "scanned": None,               # last QR used on the payment form (shows the name)
+    "pending_payment": None,       # payment waiting for the password
+    "verified_payment": None,      # payment whose password was correct, ready to send
+    "pw_attempts": 0,              # wrong passwords so far
+    "pw_locked_until": 0.0,        # time.time() until which payments are locked
 }
 for key, value in DEFAULTS.items():
     st.session_state.setdefault(key, value)
@@ -265,6 +283,11 @@ def set_status(entry_id, status):
 def deduct_balance(amount):
     """Take a sent payment out of the customer's balance (never below zero)."""
     st.session_state["balance"] = max(0.0, st.session_state["balance"] - amount)
+
+
+def lock_seconds_left():
+    """How many seconds payments stay locked after too many wrong passwords (0 = not locked)."""
+    return max(0, int(round(st.session_state["pw_locked_until"] - time.time())))
 
 
 # ======================================================================
@@ -388,8 +411,49 @@ def parse_upi_qr(text):
 
 
 # ======================================================================
-# 3. Payment check and warning popup
+# 3. Payment password, fraud check and warning popup
 # ======================================================================
+@st.dialog("Confirm payment")
+def password_dialog():
+    """Asks for the account password before a payment is sent (like a UPI PIN)."""
+    pending = st.session_state.get("pending_payment")
+    if not pending:
+        return
+    payload = pending["payload"]
+    st.markdown(f"Paying **₹{payload['amount']:,.2f}** to **{pending['payee']}**")
+    st.caption(f"Enter your {APP_NAME} account password to authorise this payment.")
+
+    with st.form("pay_password_form", clear_on_submit=True):   # clears the box after each try
+        password = st.text_input("Password", type="password")
+        confirmed = st.form_submit_button("Confirm and pay", type="primary")
+
+    if st.button("Cancel", key="pay_password_cancel"):
+        st.session_state["pending_payment"] = None
+        st.session_state["outcome"] = ("warning", "Payment cancelled. Nothing was sent.")
+        st.rerun()
+
+    if confirmed:
+        if auth.verify_user(current_user()["email"], password):
+            # correct: hand the payment to the page, which sends it after this popup closes
+            st.session_state["pw_attempts"] = 0
+            st.session_state["verified_payment"] = pending
+            st.session_state["pending_payment"] = None
+            st.rerun()
+
+        st.session_state["pw_attempts"] += 1
+        left = MAX_PASSWORD_ATTEMPTS - st.session_state["pw_attempts"]
+        if left <= 0:
+            # too many wrong tries: lock payments for a minute and close the popup
+            st.session_state["pw_attempts"] = 0
+            st.session_state["pw_locked_until"] = time.time() + LOCK_SECONDS
+            st.session_state["pending_payment"] = None
+            st.session_state["outcome"] = ("error",
+                f"{MAX_PASSWORD_ATTEMPTS} wrong password attempts. Payments are locked. "
+                f"Please wait {LOCK_SECONDS // 60} minute and try again.")
+            st.rerun()
+        st.error(f"Wrong password. {left} attempt{'s' if left != 1 else ''} left.")
+
+
 @st.dialog("Suspicious payment detected")
 def warning_dialog(entry_id, payee, amount, result, uses_balance=True):
     st.error(f"This payment of ₹{amount:,.2f} to {payee} has a "
@@ -565,7 +629,7 @@ def show_home():
 
     left, right = st.columns([2, 1])
     with left:
-        with st.container(border=True):
+        with st.container(border=True, key="card_activity"):
             eyebrow("Payment activity")
             st.subheader("Recent transactions")
             if history:
@@ -574,7 +638,7 @@ def show_home():
                 st.info("No transactions yet. Your payment activity will "
                         "appear here once you start making payments.")
     with right:
-        with st.container(border=True):
+        with st.container(border=True, key="card_check_payment"):
             eyebrow("Before you pay")
             st.subheader("Check a payment")
             st.write(f"Not sure whether a payment request is genuine? "
@@ -591,7 +655,7 @@ def show_scan_qr():
 
     scan_col, result_col = st.columns([3, 2], gap="large")
     with scan_col:
-        with st.container(border=True):
+        with st.container(border=True, key="card_scan"):
             tab_cam, tab_up = st.tabs(["Use camera", "Upload QR image"])
             with tab_cam:
                 photo = st.camera_input("Hold the QR code in front of the camera",
@@ -604,7 +668,7 @@ def show_scan_qr():
     source = photo or upload
     with result_col:
         if source is None:
-            with st.container(border=True):
+            with st.container(border=True, key="card_scan_empty"):
                 st.info("Take a photo or upload an image of the QR code to see who it pays.")
             return
 
@@ -621,7 +685,7 @@ def show_scan_qr():
                 st.code(info["raw"])
             return
 
-        with st.container(border=True):
+        with st.container(border=True, key="card_scan_result"):
             eyebrow("Scanned payee")
             st.subheader(info["name"] or "Name not included in this QR")
             st.markdown(f"UPI ID: `{info['vpa']}`")
@@ -648,13 +712,19 @@ def show_safety_check():
             st.session_state["pay_amount"] = prefill["amount"]
         st.session_state["scan_prefill"] = None
 
+    # Password was correct in the popup? Send the payment now (fraud check + warning as usual).
+    verified = st.session_state.get("verified_payment")
+    if verified:
+        st.session_state["verified_payment"] = None
+        check_and_pay(verified["payee"], verified["payload"])
+
     balance = st.session_state["balance"]
     usual = st.session_state["acct_usual"]
 
     form_col, info_col = st.columns([3, 2], gap="large")
 
     with form_col:
-        with st.container(border=True):
+        with st.container(border=True, key="card_payment_form"):
             choice = st.selectbox("Pay to", list(PAYEES), key="pay_to")
             tx_type, payee_known = PAYEES[choice]
 
@@ -675,33 +745,42 @@ def show_safety_check():
                 key="pay_request")
 
             if st.button("Pay now", type="primary"):
-                if choice == NEW_PAYEE and not payee_name:
+                wait = lock_seconds_left()
+                if wait:
+                    st.error(f"Too many wrong password attempts. Try again in {wait} seconds.")
+                elif choice == NEW_PAYEE and not payee_name:
                     st.error("Enter the UPI ID to continue.")
                 elif amount > balance:
                     st.error("Insufficient balance.")
                 else:
-                    check_and_pay(payee_name, {
-                        "amount": amount,
-                        "type": tx_type,
-                        "oldbalanceOrg": balance,
-                        "newbalanceOrig": balance - amount,
-                        "oldbalanceDest": 0.0,
-                        # merchants keep no balance in the dataset; people do
-                        "newbalanceDest": 0.0 if tx_type == "PAYMENT" else amount,
-                        "hour": now_ist().hour,         # Indian hour of day for the model
-                        # context the safety rules use (a real app knows these itself)
-                        "payee_known": payee_known,
-                        "is_collect_request": is_request,
-                        "usual_amount": usual,
-                    })
+                    st.session_state["outcome"] = None
+                    st.session_state["pending_payment"] = {
+                        "payee": payee_name,
+                        "payload": {
+                            "amount": amount,
+                            "type": tx_type,
+                            "oldbalanceOrg": balance,
+                            "newbalanceOrig": balance - amount,
+                            "oldbalanceDest": 0.0,
+                            # merchants keep no balance in the dataset; people do
+                            "newbalanceDest": 0.0 if tx_type == "PAYMENT" else amount,
+                            "hour": now_ist().hour,     # Indian hour of day for the model
+                            # context the safety rules use (a real app knows these itself)
+                            "payee_known": payee_known,
+                            "is_collect_request": is_request,
+                            "usual_amount": usual,
+                        },
+                    }
+                    password_dialog()                   # ask for the password first
 
         outcome = st.session_state.get("outcome")
         if outcome:
             kind, text = outcome
-            (st.success if kind == "success" else st.warning)(text)
+            show = {"success": st.success, "warning": st.warning, "error": st.error}
+            show.get(kind, st.info)(text)
 
     with info_col:
-        with st.container(border=True):
+        with st.container(border=True, key="card_account"):
             eyebrow("From account")
             # read it fresh, so a payment made just above shows up immediately
             st.metric("Available balance", f"₹{st.session_state['balance']:,.2f}")
@@ -753,11 +832,11 @@ def show_insights():
     safe = sum(1 for h in history if h["Verdict"] == "SAFE")
     left, right = st.columns(2)
     with left:
-        with st.container(border=True):
+        with st.container(border=True, key="card_insight_split"):
             st.subheader("Safe vs flagged")
             st.bar_chart(pd.Series({"Safe": safe, "Flagged": len(history) - safe}))
     with right:
-        with st.container(border=True):
+        with st.container(border=True, key="card_insight_risk"):
             st.subheader("Risk % over time")
             st.line_chart(pd.Series([h["Risk %"] for h in reversed(history)]))
 
@@ -800,7 +879,7 @@ def live_feed():
         st.error(f"**Latest alert** ({a['Time']}): ₹{a['Amount (₹)']:,.0f} "
                  f"{a['Type']}, risk {a['Risk %']}%\n\n{a['Why flagged']}")
 
-    with st.container(border=True):
+    with st.container(border=True, key="card_live_feed"):
         eyebrow("Live payments")
         if feed:
             st.dataframe(pd.DataFrame(feed).style.apply(colour_rows, axis=1),

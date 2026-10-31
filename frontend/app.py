@@ -1,11 +1,11 @@
-# frontend/app.py  (v6: login + indigo theme + safety tips + helpline + Scan QR)
+# frontend/app.py  (v8: login + indigo theme + safety tips + helpline + Scan QR + live balance + IST)
 import base64
 import io
 import os
 import random
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, unquote
 
 import numpy as np
@@ -32,7 +32,17 @@ API = os.environ.get("API_URL", "http://localhost:8000")    # where the FastAPI 
 DEMO_MODE = os.environ.get("DEMO_MODE", "1") == "1"         # "0" hides everything meant for judges
 FEED_SECONDS = int(os.environ.get("FEED_SECONDS", "1"))     # how often the bank feed refreshes
 TIP_SECONDS = int(os.environ.get("TIP_SECONDS", "3"))       # how often the safety tip changes
+START_BALANCE = 50000.0                                     # balance every new session starts with
 APP_NAME = "LOSAGA"
+
+# Indian Standard Time (UTC+5:30). The cloud server's clock is UTC, so we never use it directly.
+IST = timezone(timedelta(hours=5, minutes=30), "IST")
+
+
+def now_ist():
+    """Current date and time in India, whatever timezone the server is in."""
+    return datetime.now(IST)
+
 
 st.set_page_config(page_title=f"{APP_NAME} | Payment Protection",
                    page_icon=":material/shield:", layout="wide")
@@ -123,14 +133,17 @@ h3 {font-size: 1.15rem !important; font-weight: 600 !important;}
 .login-title {font-size: 2.3rem; font-weight: 800; letter-spacing: .1em; color: #190066;}
 .login-tag {color: #4a4a78; margin-top: .8rem;}
 
-/* Safety tip card (warm yellow, top right) and scam helpline card (under Check a payment) */
-.tip-card, .help-card {border-radius: 16px; padding: 1.4rem 1.7rem;}
-.tip-card {background: #fbefd6; min-height: 8.5rem; margin: 0;}
-.help-card {background: #f4f7fb; border: 1px solid #dfe5f2; margin: 1rem 0 0 0;}
+/* Safety tip card (compact, top right) and scam helpline card (under Check a payment) */
+.tip-card {background: #fbefd6; border-radius: 14px; padding: .9rem 1.2rem;
+           min-height: 6rem; margin: 0 0 1.2rem 0;}
+.help-card {background: #f4f7fb; border: 1px solid #dfe5f2; border-radius: 16px;
+            padding: 1.4rem 1.7rem; margin: 1rem 0 0 0;}
 .card-label {font-size: .78rem; font-weight: 700; letter-spacing: .16em;
              text-transform: uppercase; color: #16284f; margin: 0 0 .7rem 0;}
 .card-text {font-size: 1.05rem; line-height: 1.6; color: #1a1a40; margin: 0;}
 .card-text a {color: #190066; font-weight: 600; text-decoration: underline;}
+.tip-card .card-label {font-size: .7rem; margin-bottom: .35rem;}
+.tip-card .card-text {font-size: .92rem; line-height: 1.45;}
 .tip-text {animation: tipFade .5s ease-in;}
 @keyframes tipFade {from {opacity: 0;} to {opacity: 1;}}
 @media (prefers-reduced-motion: reduce) {.tip-text {animation: none;}}
@@ -201,7 +214,7 @@ DEFAULTS = {
     "pay_upi": "",
     "pay_amount": 500.0,
     "pay_request": False,
-    "acct_balance": 50000.0,       # the customer's account
+    "balance": START_BALANCE,      # the customer's account (resets on reload / log out)
     "acct_usual": 1000.0,          # their typical payment size
     "tip_index": 0,                # which safety tip is showing
     "scan_prefill": None,          # QR result waiting to fill the payment form
@@ -247,6 +260,11 @@ def set_status(entry_id, status):
         if h["id"] == entry_id:
             h["Status"] = status
     auth.update_status(entry_id, status)               # also save it in the database
+
+
+def deduct_balance(amount):
+    """Take a sent payment out of the customer's balance (never below zero)."""
+    st.session_state["balance"] = max(0.0, st.session_state["balance"] - amount)
 
 
 # ======================================================================
@@ -373,7 +391,7 @@ def parse_upi_qr(text):
 # 3. Payment check and warning popup
 # ======================================================================
 @st.dialog("Suspicious payment detected")
-def warning_dialog(entry_id, payee, amount, result):
+def warning_dialog(entry_id, payee, amount, result, uses_balance=True):
     st.error(f"This payment of ₹{amount:,.2f} to {payee} has a "
              f"{result['risk_score'] * 100:.0f}% risk of being fraud.")
     st.caption(f"Flagged by: {result['flagged_by']}")
@@ -389,13 +407,16 @@ def warning_dialog(entry_id, payee, amount, result):
         st.rerun()                # closes the popup and refreshes the page
     if right.button("Pay anyway"):
         set_status(entry_id, "Sent despite warning")
+        if uses_balance:
+            deduct_balance(amount)            # the money actually left the account
         st.session_state["outcome"] = ("warning",
             f"₹{amount:,.2f} was sent to {payee} despite the warning.")
         st.rerun()
 
 
-def check_and_pay(payee, payload):
-    """Score the payment with the API. SAFE -> sent. RISKY -> warning popup."""
+def check_and_pay(payee, payload, uses_balance=True):
+    """Score the payment with the API. SAFE -> sent. RISKY -> warning popup.
+    uses_balance=False for dataset demo payments, which aren't the customer's money."""
     st.session_state["outcome"] = None
     result = api_post("/score", payload)
     if result is None:
@@ -405,7 +426,7 @@ def check_and_pay(payee, payload):
     risky = result["verdict"] == "RISKY"
     entry = {
         "id": uuid.uuid4().hex[:8],
-        "When": datetime.now().strftime("%d %b, %H:%M"),
+        "When": now_ist().strftime("%d %b, %H:%M"),        # Indian time, not server time
         "Payee": payee,
         "Type": payload["type"],
         "Amount (₹)": round(payload["amount"], 2),
@@ -418,11 +439,14 @@ def check_and_pay(payee, payload):
     auth.add_payment(current_user()["email"], entry)         # save it for next login
 
     if risky:
-        warning_dialog(entry["id"], payee, payload["amount"], result)
+        warning_dialog(entry["id"], payee, payload["amount"], result, uses_balance)
     else:
+        if uses_balance:
+            deduct_balance(payload["amount"])
         st.session_state["outcome"] = ("success",
             f"₹{payload['amount']:,.2f} sent to {payee}. "
-            f"Risk {result['risk_score'] * 100:.0f}%, looks safe.")
+            f"Risk {result['risk_score'] * 100:.0f}%, looks safe. "
+            f"Balance left: ₹{st.session_state['balance']:,.2f}")
 
 
 def run_dataset_payment(fraud):
@@ -432,7 +456,8 @@ def run_dataset_payment(fraud):
         st.error("Could not reach the fraud engine.")
         return
     data.pop("actual_label")               # remove the answer key
-    check_and_pay(random.choice(["Rahul Kumar", "Priya Sharma", "Amit Verma"]), data)
+    check_and_pay(random.choice(["Rahul Kumar", "Priya Sharma", "Amit Verma"]), data,
+                  uses_balance=False)
 
 
 def scenario_normal():
@@ -623,7 +648,7 @@ def show_safety_check():
             st.session_state["pay_amount"] = prefill["amount"]
         st.session_state["scan_prefill"] = None
 
-    balance = st.session_state["acct_balance"]
+    balance = st.session_state["balance"]
     usual = st.session_state["acct_usual"]
 
     form_col, info_col = st.columns([3, 2], gap="large")
@@ -663,7 +688,7 @@ def show_safety_check():
                         "oldbalanceDest": 0.0,
                         # merchants keep no balance in the dataset; people do
                         "newbalanceDest": 0.0 if tx_type == "PAYMENT" else amount,
-                        "hour": datetime.now().hour,    # the system fills in the time
+                        "hour": now_ist().hour,         # Indian hour of day for the model
                         # context the safety rules use (a real app knows these itself)
                         "payee_known": payee_known,
                         "is_collect_request": is_request,
@@ -678,7 +703,8 @@ def show_safety_check():
     with info_col:
         with st.container(border=True):
             eyebrow("From account")
-            st.metric("Available balance", f"₹{balance:,.2f}")
+            # read it fresh, so a payment made just above shows up immediately
+            st.metric("Available balance", f"₹{st.session_state['balance']:,.2f}")
             st.caption("Savings account ending 4821. Every payment is checked "
                        "for fraud before it is sent.")
 
@@ -692,8 +718,11 @@ def show_safety_check():
             if d3.button("Run a real dataset scam"):
                 run_dataset_payment(fraud=True)
             a1, a2 = st.columns(2)
-            a1.number_input("Account balance (₹)", min_value=0.0, step=1000.0,
-                            key="acct_balance")
+            a1.number_input("Set balance to (₹)", min_value=0.0, step=1000.0,
+                            value=START_BALANCE, key="demo_balance")
+            if a1.button("Update balance"):
+                st.session_state["balance"] = st.session_state["demo_balance"]
+                st.rerun()
             a2.number_input("Usual payment size (₹)", min_value=1.0, step=100.0,
                             key="acct_usual")
 
@@ -741,7 +770,7 @@ def live_feed():
         if item is not None:
             p, r = item["payment"], item["result"]
             row = {
-                "Time": datetime.now().strftime("%H:%M:%S"),
+                "Time": now_ist().strftime("%H:%M:%S"),   # Indian time
                 "Type": p["type"],
                 "Amount (₹)": round(p["amount"], 2),
                 "Risk %": round(r["risk_score"] * 100),

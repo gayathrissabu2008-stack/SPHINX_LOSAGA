@@ -1,0 +1,19 @@
+# Frontend: Streamlit app. Python 3.11 or 3.12 recommended.
+# Install:  pip install -r requirements.txt
+# (The app was tested on Streamlit 1.66; it needs a recent version for
+#  st.navigation, st.dialog and st.fragment(run_every=...).)
+streamlit>=1.66
+requests>=2.31
+pandas>=2.0
+# Backend: FastAPI + fraud model. Python 3.11 or 3.12 recommended.
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.0
+pandas>=2.0
+numpy>=1.26
+scikit-learn>=1.3
+# IMPORTANT: use the same xgboost version you trained the model with.
+# Check it in your working environment with:  pip show xgboost
+# Then replace the line below with  xgboost==THAT.VERSION
+xgboost>=2.0
+shap>=0.45

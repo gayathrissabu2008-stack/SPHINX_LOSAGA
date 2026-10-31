@@ -1,15 +1,29 @@
-# frontend/app.py  (v5: login system + indigo theme + rotating safety tips + scam helpline)
+# frontend/app.py  (v6: login + indigo theme + safety tips + helpline + Scan QR)
 import base64
+import io
 import os
 import random
+import re
 import uuid
 from datetime import datetime
+from urllib.parse import parse_qs, unquote
 
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+from PIL import Image, ImageOps
 
 import auth                      # our login module (frontend/auth.py)
+
+try:                             # main QR decoder (pip install zxing-cpp)
+    import zxingcpp
+except ImportError:
+    zxingcpp = None
+try:                             # backup decoder, only used if OpenCV is installed
+    import cv2
+except ImportError:
+    cv2 = None
 
 # ======================================================================
 # Settings. Override with environment variables when you deploy.
@@ -109,17 +123,20 @@ h3 {font-size: 1.15rem !important; font-weight: 600 !important;}
 .login-title {font-size: 2.3rem; font-weight: 800; letter-spacing: .1em; color: #190066;}
 .login-tag {color: #4a4a78; margin-top: .8rem;}
 
-/* Safety tip card (warm yellow) and scam helpline card (light grey-blue) */
-.tip-card, .help-card {border-radius: 16px; padding: 1.4rem 1.7rem; margin: 1rem 0 0 0;}
-.tip-card {background: #fbefd6; min-height: 8.5rem;}
-.help-card {background: #f4f7fb; border: 1px solid #dfe5f2;}
+/* Safety tip card (warm yellow, top right) and scam helpline card (under Check a payment) */
+.tip-card, .help-card {border-radius: 16px; padding: 1.4rem 1.7rem;}
+.tip-card {background: #fbefd6; min-height: 8.5rem; margin: 0;}
+.help-card {background: #f4f7fb; border: 1px solid #dfe5f2; margin: 1rem 0 0 0;}
 .card-label {font-size: .78rem; font-weight: 700; letter-spacing: .16em;
              text-transform: uppercase; color: #16284f; margin: 0 0 .7rem 0;}
-.card-text {font-size: 1.08rem; line-height: 1.6; color: #1a1a40; margin: 0;}
+.card-text {font-size: 1.05rem; line-height: 1.6; color: #1a1a40; margin: 0;}
 .card-text a {color: #190066; font-weight: 600; text-decoration: underline;}
 .tip-text {animation: tipFade .5s ease-in;}
 @keyframes tipFade {from {opacity: 0;} to {opacity: 1;}}
 @media (prefers-reduced-motion: reduce) {.tip-text {animation: none;}}
+
+/* Scan QR button, pushed to the right edge of the home page header */
+.st-key-home_scan {align-items: flex-end;}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -187,6 +204,8 @@ DEFAULTS = {
     "acct_balance": 50000.0,       # the customer's account
     "acct_usual": 1000.0,          # their typical payment size
     "tip_index": 0,                # which safety tip is showing
+    "scan_prefill": None,          # QR result waiting to fill the payment form
+    "scanned": None,               # last QR used on the payment form (shows the name)
 }
 for key, value in DEFAULTS.items():
     st.session_state.setdefault(key, value)
@@ -255,6 +274,99 @@ def scam_help_card():
         '<a href="https://cybercrime.gov.in" target="_blank" rel="noopener">cybercrime.gov.in</a>.'
         '</p></div>',
         unsafe_allow_html=True)
+
+
+# ======================================================================
+# 2c. QR scanning: reads UPI QRs from Google Pay, PhonePe, Paytm, BHIM and BharatQR
+# ======================================================================
+VPA_RE = re.compile(r"[A-Za-z0-9._\-]{2,256}@[A-Za-z][A-Za-z0-9.\-]{1,64}")   # name@bank
+
+
+def _image_variants(img):
+    """A few cleaned-up versions of the photo. If one fails to decode, the next may work."""
+    img = ImageOps.exif_transpose(img).convert("RGB")     # fix sideways phone photos
+    gray = ImageOps.grayscale(img)
+    variants = [img, gray, ImageOps.autocontrast(gray)]
+    w, h = gray.size
+    if max(w, h) > 1600:                                   # very large photo: shrink it
+        scale = 1600 / max(w, h)
+        variants.append(gray.resize((int(w * scale), int(h * scale))))
+    if max(w, h) < 600:                                    # tiny screenshot: enlarge it
+        variants.append(gray.resize((w * 3, h * 3), Image.NEAREST))
+    variants.append(gray.point(lambda p: 255 if p > 128 else 0))   # pure black and white
+    return variants
+
+
+@st.cache_data(show_spinner=False)      # same image twice -> no need to decode again
+def decode_qr(image_bytes):
+    """Returns the text stored inside the QR code, or None if no QR was found."""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+    except Exception:
+        return None
+    for variant in _image_variants(img):
+        pixels = np.array(variant)
+        if zxingcpp is not None:
+            for result in zxingcpp.read_barcodes(pixels):
+                if result.text:
+                    return result.text
+        if cv2 is not None:
+            text, _, _ = cv2.QRCodeDetector().detectAndDecode(pixels)
+            if text:
+                return text
+    return None
+
+
+def _tlv(data):
+    """Splits a BharatQR string into {tag: value}. Each field is 2-digit tag + 2-digit length + value."""
+    fields, i = {}, 0
+    while i + 4 <= len(data):
+        tag, length = data[i:i + 2], data[i + 2:i + 4]
+        if not length.isdigit():
+            break
+        n = int(length)
+        fields[tag] = data[i + 4:i + 4 + n]
+        i += 4 + n
+    return fields
+
+
+def _parse_bharat_qr(text):
+    """Shop QRs (BharatQR / EMV format) keep the UPI ID inside tags 02-51 and the name in tag 59."""
+    top = _tlv(text)
+    params = {}
+    for tag, value in top.items():
+        if tag.isdigit() and 2 <= int(tag) <= 51:
+            for sub_value in _tlv(value).values():
+                if "@" in sub_value and "pa" not in params:
+                    params["pa"] = sub_value
+    if "59" in top:
+        params["pn"] = top["59"]
+    if "54" in top:
+        params["am"] = top["54"]
+    return params
+
+
+def parse_upi_qr(text):
+    """Turns the QR text into {vpa, name, amount, note, raw}, whatever app made it."""
+    text = (text or "").strip().replace("&amp;", "&")
+    if text.startswith("000201"):                          # BharatQR shop code
+        params = _parse_bharat_qr(text)
+    else:                                                  # upi://pay?..., UPI://PAY/?..., web links
+        query = text.split("?", 1)[1] if "?" in text else ""
+        params = {k.lower(): v[0] for k, v in parse_qs(query).items()}   # decodes %20 and +
+
+    vpa = params.get("pa", "").strip()
+    if not vpa:                                            # last resort: find name@bank anywhere
+        match = VPA_RE.search(unquote(text))
+        vpa = match.group(0) if match else ""
+
+    try:
+        amount = float(params.get("am") or 0)
+    except ValueError:
+        amount = 0.0
+
+    return {"vpa": vpa.lower(), "name": params.get("pn", "").strip(),
+            "amount": amount, "note": params.get("tn", "").strip(), "raw": text}
 
 
 # ======================================================================
@@ -401,10 +513,19 @@ def show_login():
 
 def show_home():
     user = current_user()
-    eyebrow("Personal payment protection")
-    st.title("Your dashboard")
-    st.subheader(f"Hello, {user['name'].split()[0]}.")
-    st.write("Here's an overview of your payment activity.")
+
+    # Top row: greeting on the left; Scan QR button + rotating safety tip on the right
+    head_left, head_right = st.columns([3, 2], gap="large", vertical_alignment="center")
+    with head_left:
+        eyebrow("Personal payment protection")
+        st.title("Your dashboard")
+        st.subheader(f"Hello, {user['name'].split()[0]}.")
+        st.write("Here's an overview of your payment activity.")
+    with head_right:
+        with st.container(key="home_scan"):
+            if st.button("Scan QR", icon=":material/qr_code_scanner:", key="home_scan_btn"):
+                st.switch_page(scan_page)
+        safety_tip_card()
 
     history = st.session_state["history"]
     total = len(history)
@@ -435,15 +556,72 @@ def show_home():
                      f"{APP_NAME} checks the risk before the money leaves your account.")
             if st.button("Make a payment", type="primary"):
                 st.switch_page(safety_page)
+        scam_help_card()          # helpline card, right under the Check a payment box
 
-    # NEW: rotating safety tip + scam helpline, full width below the cards
-    safety_tip_card()
-    scam_help_card()
+
+def show_scan_qr():
+    eyebrow("Scan to pay")
+    st.title("Scan a QR code")
+    st.write("Works with QR codes from Google Pay, PhonePe, Paytm, BHIM and shop BharatQR codes.")
+
+    scan_col, result_col = st.columns([3, 2], gap="large")
+    with scan_col:
+        with st.container(border=True):
+            tab_cam, tab_up = st.tabs(["Use camera", "Upload QR image"])
+            with tab_cam:
+                photo = st.camera_input("Hold the QR code in front of the camera",
+                                        key="qr_camera")
+            with tab_up:
+                upload = st.file_uploader("Screenshot or photo of a QR code",
+                                          type=["png", "jpg", "jpeg", "webp"],
+                                          key="qr_upload")
+
+    source = photo or upload
+    with result_col:
+        if source is None:
+            with st.container(border=True):
+                st.info("Take a photo or upload an image of the QR code to see who it pays.")
+            return
+
+        text = decode_qr(source.getvalue())
+        if text is None:
+            st.error("No QR code found in this image. Fill the frame with the QR, "
+                     "avoid glare, and try again.")
+            return
+
+        info = parse_upi_qr(text)
+        if not info["vpa"]:
+            st.error("This QR code isn't a UPI payment code.")
+            with st.expander("What the QR contains"):
+                st.code(info["raw"])
+            return
+
+        with st.container(border=True):
+            eyebrow("Scanned payee")
+            st.subheader(info["name"] or "Name not included in this QR")
+            st.markdown(f"UPI ID: `{info['vpa']}`")
+            if info["amount"]:
+                st.markdown(f"Amount requested: **₹{info['amount']:,.2f}**")
+            if info["note"]:
+                st.caption(f"Note: {info['note']}")
+            st.caption(f"{APP_NAME} checks this payment for fraud before it's sent.")
+            if st.button("Pay this person", type="primary", key="qr_pay"):
+                st.session_state["scan_prefill"] = info
+                st.switch_page(safety_page)
 
 
 def show_safety_check():
     eyebrow("Before you pay")
     st.title("Make a payment")
+
+    # Coming from Scan QR? Fill the form with the scanned payee before the widgets are drawn.
+    prefill = st.session_state.get("scan_prefill")
+    if prefill:
+        st.session_state.update({"pay_to": NEW_PAYEE, "pay_upi": prefill["vpa"],
+                                 "pay_request": False, "scanned": prefill})
+        if prefill["amount"] >= 1:
+            st.session_state["pay_amount"] = prefill["amount"]
+        st.session_state["scan_prefill"] = None
 
     balance = st.session_state["acct_balance"]
     usual = st.session_state["acct_usual"]
@@ -458,6 +636,10 @@ def show_safety_check():
             if choice == NEW_PAYEE:
                 payee_name = st.text_input("UPI ID", placeholder="name@bank",
                                            key="pay_upi").strip()
+                scanned = st.session_state.get("scanned")
+                if scanned and scanned["name"] and scanned["vpa"] == payee_name.lower():
+                    st.caption(f"Scanned QR belongs to: {scanned['name']}")
+                    payee_name = f"{scanned['name']} ({payee_name})"
             else:
                 payee_name = choice.split(" (")[0]      # "Rahul Kumar"
 
@@ -616,6 +798,8 @@ def show_bank_view():
 # ======================================================================
 login_page = st.Page(show_login, title="Sign in", url_path="login", default=True)
 home_page = st.Page(show_home, title="Home", icon=":material/home:", default=True)
+scan_page = st.Page(show_scan_qr, title="Scan QR",
+                    icon=":material/qr_code_scanner:", url_path="scan-qr")
 safety_page = st.Page(show_safety_check, title="Safety Check",
                       icon=":material/shield:", url_path="safety-check")
 tx_page = st.Page(show_transactions, title="My Transactions",
@@ -657,7 +841,7 @@ else:
     if user["role"] == "bank":
         groups = [("FOR BANKS", [bank_page])]
     else:
-        groups = [("MENU", [home_page, safety_page, tx_page, insights_page])]
+        groups = [("MENU", [home_page, scan_page, safety_page, tx_page, insights_page])]
     pg = st.navigation([p for _, pages in groups for p in pages], position="hidden")
     render_sidebar(user, groups)
 
